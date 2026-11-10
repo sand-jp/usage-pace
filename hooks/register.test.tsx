@@ -1,6 +1,7 @@
-import { expect, test } from 'claude-code/testing'
+import { expect, mock, test } from 'claude-code/testing'
+import type { CommandRunInput, On } from 'claude-code'
 
-import { applyArgs, contextLevel, contextPercent, duration, meterSvg, pace, pickLanguage, resetClock, setLanguage, statusLine, tokens } from './register'
+import { applyArgs, contextLevel, contextPercent, duration, meterSvg, modelTag, pace, pickLanguage, resetClock, scopedLimits, setLanguage, statusLine, tokens } from './register'
 
 const HOUR = 3_600_000
 const NOW = Date.parse('2026-11-08T12:00:00Z')
@@ -68,10 +69,10 @@ test('context figures and colours', async () => {
 })
 
 test('command arguments', async () => {
-  const all = { pace: true, context: true, line: true, tiny: false, clock: true }
+  const all = { pace: true, context: true, line: true, tiny: false, clock: true, model: true }
   expect(applyArgs(all, 'line off')).toEqual({ ...all, line: false })
   expect(applyArgs(all, 'context')).toEqual({ ...all, context: false })
-  expect(applyArgs(all, 'all')).toEqual({ ...all, pace: false, context: false, line: false, clock: false })
+  expect(applyArgs(all, 'all')).toEqual({ ...all, pace: false, context: false, line: false, clock: false, model: false })
   expect(applyArgs(all, 'clock off')).toEqual({ ...all, clock: false })
   expect(applyArgs({ ...all, clock: false }, 'clock')).toEqual(all)
   expect(applyArgs({ ...all, line: false }, 'line tiny')).toEqual({ ...all, tiny: true })
@@ -79,7 +80,7 @@ test('command arguments', async () => {
   expect(applyArgs({ ...all, tiny: true }, 'line off')).toEqual({ ...all, line: false, tiny: true })
   expect(typeof applyArgs(all, 'pace tiny')).toBe('string')
   expect(applyArgs({ ...all, line: false }, 'all')).toEqual(all)
-  expect(applyArgs(all, 'all off')).toEqual({ ...all, pace: false, context: false, line: false, clock: false })
+  expect(applyArgs(all, 'all off')).toEqual({ ...all, pace: false, context: false, line: false, clock: false, model: false })
   expect(typeof applyArgs(all, 'constructor')).toBe('string')
   expect(typeof applyArgs(all, 'line maybe')).toBe('string')
 })
@@ -191,13 +192,142 @@ test('the reset time, in local time', () => {
   expect(resetClock({ resetAt: new Date(2026, 10, 14, 14, 30).getTime(), isWeekly: false })).toBe('14:30')
 })
 
-test('a broken store file: the pane still shows this chat', async ($, on) => {
+// the usage endpoint's rows, as it answered on a Max plan (2026-11-10)
+const USAGE_BODY = {
+  five_hour: { utilization: 14, resets_at: at(3 * HOUR) },
+  limits: [
+    { kind: 'session', group: 'session', percent: 14, severity: 'normal', resets_at: at(3 * HOUR), scope: null, is_active: false },
+    { kind: 'weekly_all', group: 'weekly', percent: 88, severity: 'warning', resets_at: at(15 * HOUR), scope: null, is_active: true },
+    { kind: 'weekly_scoped', group: 'weekly', percent: 21, severity: 'normal', resets_at: at(15 * HOUR), scope: { model: { id: null, display_name: 'Fable' }, surface: null }, is_active: false },
+    { kind: 'weekly_scoped', group: 'weekly', percent: 5, severity: 'normal', resets_at: at(15 * HOUR), scope: { model: null, surface: { display_name: 'Cowork' } }, is_active: false },
+  ],
+}
+
+test('the per-model weekly windows of the usage endpoint', () => {
+  expect(scopedLimits(USAGE_BODY)).toEqual([{ kind: 'seven_day_model', percentUsed: 21, model: 'Fable', resetsAt: at(15 * HOUR) }])
+  expect(scopedLimits({})).toEqual([])
+  expect(scopedLimits(null)).toEqual([])
+  expect(scopedLimits({ limits: [null, 3, { kind: 'weekly_scoped', percent: 'x', scope: { model: { display_name: 'Fable' } } }] })).toEqual([])
+
+  const fable = pace({ kind: 'seven_day_model', percentUsed: 30, model: 'Fable', resetsAt: at(84 * HOUR) }, NOW)!
+  expect(fable.label).toBe('Fable')
+  expect(fable.tag).toBe('F')
+  expect(fable.isWeekly).toBe(true)
+  expect(fable.projected).toBe(60)
+  expect(modelTag('Sonnet')).toBe('SO')
+  expect(modelTag('Opus')).toBe('O')
+  expect(modelTag('')).toBe('M')
+})
+
+function chat(on: On, store: Map<string, unknown>) {
   on('command.register', () => ({ value: { command: 'usage-pace' } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('settings.read', () => ({ value: { language: 'japanese' } }))
-  on('clock.now', () => ({ value: NOW }))
-  on('clock.every', () => ({ value: { cancel: () => {} } }))
+  on('ui.panes', () => ({ value: [] }))
+  on('store.get', (_, e) => ({ value: store.get(e.key) }))
+  on('store.set', (_, e) => {
+    store.set(e.key, e.value)
+    return { value: undefined }
+  })
+  on('session.usage', () => ({
+    value: {
+      startedAt: NOW,
+      context: { percent: 0 },
+      rateLimits: [{ kind: 'seven_day', percentUsed: 88, resetsAt: at(15 * HOUR) }],
+    },
+  }) as never)
+}
+
+// the command as the person types it
+const typed = (args: string) => ({ command: 'usage-pace', args }) as CommandRunInput
+
+test('the Fable gauge: asked once, shown in the pane and the line', async ($, on) => {
+  const store = new Map<string, unknown>()
+  const clock = mock.clock(on, { now: NOW })
+  chat(on, store)
+  const asked: string[] = []
+  let lastStatus: string | undefined
+  on('ui.status', (_, e) => {
+    lastStatus = e.text
+    return { value: undefined }
+  })
+  on('session.authorize', () => ({ value: { handle: 'h1', kind: 'bearer' } }))
+  on('http.fetch', (_, e) => {
+    asked.push(`${e.url} ${e.init?.auth}`)
+    return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify(USAGE_BODY) } }
+  })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await clock.settle()
+  expect(asked).toEqual(['https://api.anthropic.com/api/oauth/usage h1'])
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect((await ui.find({ type: 'Text', text: /Fable/ }))?.text).toContain('21%')
+    await ui.unmount()
+  }
+  expect(lastStatus).toContain('[F] 21%')
+
+  // a reading shared by the chats: not asked again within 5 minutes
+  await $.command.run(typed('model on'))
+  await clock.settle()
+  expect(asked.length).toBe(1)
+  expect(store.get('lastScoped')).toEqual({ at: NOW, limits: scopedLimits(USAGE_BODY) })
+})
+
+test('no Fable gauge when it is off, and none past its reset', async ($, on) => {
+  const store = new Map<string, unknown>()
+  const clock = mock.clock(on, { now: NOW })
+  chat(on, store)
+  let asked = 0
+  on('session.authorize', () => ({ value: { handle: 'h1', kind: 'bearer' } }))
+  on('http.fetch', () => {
+    asked++
+    return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify(USAGE_BODY) } }
+  })
+  store.set('parts', { pace: true, context: true, line: true, tiny: false, clock: true, model: false })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await clock.settle()
+  expect(asked).toBe(0)
+  let ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /Fable/ })).toBe(undefined)
+  await ui.unmount()
+
+  // on again, with a fresh saved reading whose window has reset: not shown, not asked
+  store.set('lastScoped', { at: NOW, limits: [{ kind: 'seven_day_model', percentUsed: 50, model: 'Fable', resetsAt: at(-HOUR) }] })
+  await $.command.run(typed('model on'))
+  await clock.settle()
+  expect(asked).toBe(0)
+  ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /Fable/ })).toBe(undefined)
+  await ui.unmount()
+})
+
+test('no first-party credential: no request, no gauge', async ($, on) => {
+  const store = new Map<string, unknown>()
+  const clock = mock.clock(on, { now: NOW })
+  chat(on, store)
+  let asked = 0
+  on('session.authorize', () => ({ value: null }))
+  on('http.fetch', () => {
+    asked++
+    return { value: { status: 200, ok: true, headers: {}, text: '{}' } }
+  })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await clock.settle()
+  expect(asked).toBe(0)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /週間/ }))?.text).toContain('88%')
+  expect(await ui.find({ type: 'Text', text: /Fable/ })).toBe(undefined)
+  await ui.unmount()
+})
+
+test('a broken store file: the pane still shows this chat, Fable included', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  on('command.register', () => ({ value: { command: 'usage-pace' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('settings.read', () => ({ value: { language: 'japanese' } }))
   on('ui.panes', () => ({ value: [] }))
   // as the engine answers a store file that is not JSON
   on('store.get', () => {
@@ -208,10 +338,14 @@ test('a broken store file: the pane still shows this chat', async ($, on) => {
   })
   on('session.usage', () => ({
     value: { startedAt: NOW, context: { percent: 0 }, rateLimits: [{ kind: 'five_hour', percentUsed: 12, resetsAt: at(2 * HOUR) }] },
-  }))
+  }) as never)
+  on('session.authorize', () => ({ value: { handle: 'h1', kind: 'bearer' } }))
+  on('http.fetch', () => ({ value: { status: 200, ok: true, headers: {}, text: JSON.stringify(USAGE_BODY) } }))
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await clock.settle()
 
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect((await ui.find({ type: 'Text', text: /5時間/ }))?.text).toContain('12%')
+  expect((await ui.find({ type: 'Text', text: /Fable/ }))?.text).toContain('21%')
   await ui.unmount()
 })

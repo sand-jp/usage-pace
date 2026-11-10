@@ -1,7 +1,7 @@
 {
   "name": "usage-pace",
   "version": "0.4.1",
-  "description": "Plan usage meters (5-hour and weekly) with elapsed time and the pace projection",
+  "description": "Plan usage meters (5-hour, weekly and per-model weekly such as Fable) with elapsed time and the pace projection",
   "author": { "name": "Sand" },
   "license": "0BSD",
   "types": "./types/index.d.ts"

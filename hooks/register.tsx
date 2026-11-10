@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Context, Limit, Parts } from '../types'
+import type { Context, Limit, Parts, Scoped } from '../types'
 
 const PANE = 'usage-pace'
 
@@ -36,12 +36,12 @@ const TEXTS = {
     opened: '使用量のペースを開いた',
     notOpened: (why: string) => `開けなかった: ${why}`,
     description: '使用量のペースの表示を切り替える',
-    names: { pace: '使用率のペース', context: 'コンテキスト', line: '入力欄の下の1行', clock: 'リセットの時刻' },
+    names: { pace: '使用率のペース', context: 'コンテキスト', line: '入力欄の下の1行', clock: 'リセットの時刻', model: 'モデル別の週間' },
     usage: [
       '/usage-pace               パネルの開閉',
       '/usage-pace <part> [on|off]  表示の切り替え(on/off を省くと反転)',
       '    part: pace(使用率のペース) / context(コンテキスト) / line(入力欄の下の1行)',
-      '          clock(パネルの見出しにリセットの時刻) / all',
+      '          clock(パネルの見出しにリセットの時刻) / model(モデル別の週間: Fable) / all',
       '/usage-pace line tiny     入力欄の下の1行を詰めて出す(line on で元に戻る)',
       '/usage-pace status        今の設定',
     ],
@@ -74,12 +74,12 @@ const TEXTS = {
     opened: 'Opened the usage pace',
     notOpened: (why: string) => `Could not open: ${why}`,
     description: 'Show or hide the parts of the usage pace',
-    names: { pace: 'Usage pace', context: 'Context', line: 'Line under the prompt', clock: 'Reset time' },
+    names: { pace: 'Usage pace', context: 'Context', line: 'Line under the prompt', clock: 'Reset time', model: 'Per-model weekly' },
     usage: [
       '/usage-pace               open or close the pane',
       '/usage-pace <part> [on|off]  show or hide a part (no on/off: flip it)',
       '    part: pace (usage pace) / context (context) / line (line under the prompt)',
-      '          clock (reset time in the pane headings) / all',
+      '          clock (reset time in the pane headings) / model (per-model weekly: Fable) / all',
       '/usage-pace line tiny     the line under the prompt, packed (line on: back to full)',
       '/usage-pace status        the current settings',
     ],
@@ -123,14 +123,16 @@ const HOUR = 60 * MINUTE
 const limits = atom({ plugin: 'usage-pace', key: 'limits' } as const, [], { shape: 'limits-1' })
 const stale = atom({ plugin: 'usage-pace', key: 'stale' } as const, false)
 const context = atom({ plugin: 'usage-pace', key: 'context' } as const, { window: 0 }, { shape: 'context-1' })
-const ALL_ON: Parts = { pace: true, context: true, line: true, tiny: false, clock: true }
-const parts = atom({ plugin: 'usage-pace', key: 'parts' } as const, ALL_ON, { shape: 'parts-3' })
+const scoped = atom({ plugin: 'usage-pace', key: 'scoped' } as const, [], { shape: 'scoped-1' })
+const ALL_ON: Parts = { pace: true, context: true, line: true, tiny: false, clock: true, model: true }
+const parts = atom({ plugin: 'usage-pace', key: 'parts' } as const, ALL_ON, { shape: 'parts-4' })
 // Bumped once a minute so the elapsed share moves between responses (no request is made).
 const tick = atom({ plugin: 'usage-pace', key: 'tick' } as const, 0)
 
 // $.store keys, shared by every chat
 const STORE_LIMITS = 'lastLimits'
 const STORE_PARTS = 'parts'
+const STORE_SCOPED = 'lastScoped'
 
 type StoreValue = Parameters<EngineInterface['store']['set']>[1]
 
@@ -153,6 +155,15 @@ async function storeSet($: EngineInterface, key: string, value: StoreValue): Pro
 const WINDOWS: Record<string, { label: 'fiveHour' | 'week'; tag: string; ms: number; unit: 'm' | 'h' }> = {
   five_hour: { label: 'fiveHour', tag: 'S', ms: 5 * HOUR, unit: 'm' },
   seven_day: { label: 'week', tag: 'W', ms: 7 * 24 * HOUR, unit: 'h' },
+  // a per-model weekly window (Fable): its label and tag come from the model
+  seven_day_model: { label: 'week', tag: 'M', ms: 7 * 24 * HOUR, unit: 'h' },
+}
+
+/** The tag of a model's window: its first letter, two when that one is taken (S, W, C). */
+export function modelTag(model: string): string {
+  const letters = model.replace(/[^A-Za-z0-9]/g, '').toUpperCase()
+  if (letters === '') return 'M'
+  return ['S', 'W', 'C'].includes(letters.charAt(0)) ? letters.slice(0, 2) : letters.charAt(0)
 }
 
 export type Pace = {
@@ -210,7 +221,9 @@ export function pace(limit: Limit, now: number): Pace | null {
     ahead = window.unit === 'm' ? `${Math.round(aheadMs / MINUTE)}m` : `${Math.round(aheadMs / HOUR)}h`
     note = T.reachAhead(ahead)
   }
-  return { label: T[window.label], tag: window.tag, used, elapsed, projected, remainingMs, resetAt, isWeekly: window.unit === 'h', ahead, note }
+  const label = limit.model ?? T[window.label]
+  const tag = limit.model !== undefined ? modelTag(limit.model) : window.tag
+  return { label, tag, used, elapsed, projected, remainingMs, resetAt, isWeekly: window.unit === 'h', ahead, note }
 }
 
 const pct = (v: number) => `${v.toFixed(1)}%`
@@ -265,11 +278,13 @@ export function statusLine(paces: Pace[], contextPct: number | null = null, isSt
 async function currentPaces($: EngineInterface): Promise<Pace[]> {
   const now = await $.clock.now()
   const isStale = await read($, stale)
-  return (await read($, limits))
+  const shown = await read($, parts)
+  const own = (await read($, limits))
     // a saved window whose reset has passed tells nothing until the next reading
     .filter(l => !isStale || (l.resetsAt !== undefined && Date.parse(l.resetsAt) > now))
-    .map(l => pace(l, now))
-    .filter((p): p is Pace => p !== null)
+  // the per-model windows are a saved reading too: one whose reset has passed is left out
+  const models = shown.model ? (await read($, scoped)).filter(l => l.resetsAt !== undefined && Date.parse(l.resetsAt) > now) : []
+  return [...own, ...models].map(l => pace(l, now)).filter((p): p is Pace => p !== null)
 }
 
 /** Text beside a marker: to its right in the left half, to its left in the right half. */
@@ -328,10 +343,74 @@ function isParts(v: unknown): v is Parts {
   return typeof v === 'object' && v !== null && [p.pace, p.context, p.line].every(b => typeof b === 'boolean')
 }
 
-/** A saved setting, from before `tiny` and `clock` too. */
+/** A saved setting, from before `tiny`, `clock` and `model` too. */
 function savedParts(v: unknown): Parts | null {
   if (!isParts(v)) return null
-  return { pace: v.pace, context: v.context, line: v.line, tiny: v.tiny === true, clock: v.clock !== false }
+  return { pace: v.pace, context: v.context, line: v.line, tiny: v.tiny === true, clock: v.clock !== false, model: v.model !== false }
+}
+
+const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
+// the engine keeps its own reading of the endpoint 5 minutes: no need to ask sooner
+const SCOPED_EVERY = 5 * MINUTE
+
+/** The per-model weekly windows (Fable) of a usage endpoint body; [] when it has none. */
+export function scopedLimits(body: unknown): Limit[] {
+  const rows = (body as { limits?: unknown } | null)?.limits
+  if (!Array.isArray(rows)) return []
+  const list: Limit[] = []
+  for (const row of rows) {
+    const r = row as { kind?: unknown; percent?: unknown; resets_at?: unknown; scope?: { model?: { display_name?: unknown } | null } | null } | null
+    const model = r?.scope?.model?.display_name
+    if (r?.kind !== 'weekly_scoped' || typeof model !== 'string' || model === '' || typeof r.percent !== 'number') continue
+    const limit: Limit = { kind: 'seven_day_model', percentUsed: r.percent, model }
+    if (typeof r.resets_at === 'string') limit.resetsAt = r.resets_at
+    list.push(limit)
+  }
+  return list
+}
+
+function isScoped(v: unknown): v is Scoped {
+  const s = v as Scoped
+  return typeof v === 'object' && v !== null && typeof s.at === 'number' && isLimitList(s.limits)
+}
+
+// a turn has ended since the endpoint was last asked: its reading may have moved
+let isScopedDirty = true
+let scopedAsking: Promise<void> | null = null
+
+/**
+ * The per-model weekly windows: `$.session.usage()` does not carry them, so the
+ * usage endpoint is asked, with the session's credential held by the host. At
+ * most once in 5 minutes, shared by every chat, and only after a turn has ended
+ * (or when the chat starts).
+ */
+async function refreshScoped($: EngineInterface): Promise<void> {
+  if (!(await read($, parts)).model) return
+  if (scopedAsking) return scopedAsking
+  scopedAsking = (async () => {
+    const now = await $.clock.now()
+    const saved = await storeGet($, STORE_SCOPED)
+    const last = isScoped(saved) ? saved : null
+    if (last && (!isScopedDirty || now - last.at < SCOPED_EVERY)) {
+      await update($, scoped, () => last.limits)
+      return
+    }
+    isScopedDirty = false
+    let list = last?.limits ?? []
+    try {
+      const auth = await $.session.authorize()
+      if (auth) {
+        const res = await $.http.fetch(USAGE_URL, { auth: auth.handle, headers: { 'Content-Type': 'application/json' } })
+        if (res.ok) list = scopedLimits(JSON.parse(res.text))
+      }
+    } catch {}
+    // a failed ask waits the same 5 minutes, keeping the last reading
+    await storeSet($, STORE_SCOPED, { at: now, limits: list })
+    await update($, scoped, () => list)
+  })().finally(() => {
+    scopedAsking = null
+  })
+  return scopedAsking
 }
 
 async function drawStatus($: EngineInterface): Promise<void> {
@@ -368,6 +447,10 @@ async function refresh($: EngineInterface): Promise<void> {
   else await loadSaved($)
   await update($, context, () => ({ ...usage.context }))
   await drawStatus($)
+  // not waited for: a slow endpoint must not hold the hook (the pane redraws on the write)
+  void refreshScoped($)
+    .then(() => drawStatus($))
+    .catch(() => {})
 }
 
 /**
@@ -395,8 +478,8 @@ async function setPaneShown($: EngineInterface, shown: Parts): Promise<void> {
   if (!wants && isOpen) await $.ui.close({ id: PANE })
 }
 
-type Part = 'pace' | 'context' | 'line' | 'clock'
-const PART_KEYS: Part[] = ['pace', 'context', 'line', 'clock']
+type Part = 'pace' | 'context' | 'line' | 'clock' | 'model'
+const PART_KEYS: Part[] = ['pace', 'context', 'line', 'clock', 'model']
 const usage = () => T.usage.join('\n')
 
 const describe = (p: Parts) =>
@@ -425,7 +508,7 @@ export const register: Register = on => {
     await $.command.register({
       name: 'usage-pace',
       description: T.description,
-      argumentHint: '[pace|context|line|clock|all] [on|off|tiny] | status',
+      argumentHint: '[pace|context|line|clock|model|all] [on|off|tiny] | status',
     })
     const saved = await storeGet($, STORE_PARTS)
     const restored = savedParts(saved)
@@ -457,6 +540,7 @@ export const register: Register = on => {
     await update($, parts, () => next)
     await storeSet($, STORE_PARTS, next)
     await setPaneShown($, next)
+    await refreshScoped($)
     await drawStatus($)
     return { text: describe(next) }
   })
@@ -470,6 +554,7 @@ export const register: Register = on => {
 
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
+    isScopedDirty = true
     await refresh($)
     return done
   })
